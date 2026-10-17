@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-import sys
-import logging
 import argparse
+import logging
+import sys
 import pymysql
 from typing import List, Dict
 
@@ -13,15 +13,14 @@ logger = logging.getLogger(__name__)
 
 
 class MySQLConnectionRemediator:
-    def __init__(self, host: str, port: int, user: str, password: str,
-                 idle_timeout: int, long_query_time: int, max_kills: int):
+    def __init__(self, host: str, port: int, user: str, password: str, 
+                 idle_threshold: int = 300, max_kill: int = 100):
         self.host = host
         self.port = port
         self.user = user
         self.password = password
-        self.idle_timeout = idle_timeout
-        self.long_query_time = long_query_time
-        self.max_kills = max_kills
+        self.idle_threshold = idle_threshold
+        self.max_kill = max_kill
         self.connection = None
 
     def connect(self):
@@ -31,7 +30,8 @@ class MySQLConnectionRemediator:
                 port=self.port,
                 user=self.user,
                 password=self.password,
-                connect_timeout=10
+                connect_timeout=10,
+                read_timeout=30
             )
             logger.info(f"Connected to MySQL at {self.host}:{self.port}")
         except Exception as e:
@@ -43,73 +43,57 @@ class MySQLConnectionRemediator:
         cursor.execute("SHOW STATUS LIKE 'Threads_connected'")
         result = cursor.fetchone()
         cursor.close()
-        count = int(result[1]) if result else 0
-        logger.info(f"Current thread count: {count}")
-        return count
+        if result:
+            count = int(result[1])
+            logger.info(f"Current THREADS_CONNECTED: {count}")
+            return count
+        return 0
 
     def get_idle_connections(self) -> List[Dict]:
         cursor = self.connection.cursor(pymysql.cursors.DictCursor)
-        query = f"""
-            SELECT id, user, host, db, command, time, state
-            FROM information_schema.processlist
-            WHERE command = 'Sleep'
-            AND time > {self.idle_timeout}
-            AND id != CONNECTION_ID()
-            ORDER BY time DESC
+        query = """
+            SELECT ID, USER, HOST, DB, COMMAND, TIME, STATE, INFO
+            FROM information_schema.PROCESSLIST
+            WHERE COMMAND = 'Sleep'
+            AND TIME > %s
+            AND ID != CONNECTION_ID()
+            ORDER BY TIME DESC
+            LIMIT %s
         """
-        cursor.execute(query)
+        cursor.execute(query, (self.idle_threshold, self.max_kill))
         results = cursor.fetchall()
         cursor.close()
-        logger.info(f"Found {len(results)} idle connections exceeding {self.idle_timeout}s")
+        logger.info(f"Found {len(results)} idle connections exceeding {self.idle_threshold}s")
         return results
 
-    def get_long_running_queries(self) -> List[Dict]:
-        cursor = self.connection.cursor(pymysql.cursors.DictCursor)
-        query = f"""
-            SELECT id, user, host, db, command, time, state, LEFT(info, 100) as query_preview
-            FROM information_schema.processlist
-            WHERE command != 'Sleep'
-            AND time > {self.long_query_time}
-            AND id != CONNECTION_ID()
-            AND user != 'system user'
-            ORDER BY time DESC
-        """
-        cursor.execute(query)
-        results = cursor.fetchall()
-        cursor.close()
-        logger.info(f"Found {len(results)} long-running queries exceeding {self.long_query_time}s")
-        return results
-
-    def kill_connection(self, conn_id: int) -> bool:
+    def kill_connection(self, connection_id: int) -> bool:
         try:
             cursor = self.connection.cursor()
-            cursor.execute(f"KILL {conn_id}")
+            cursor.execute(f"KILL {connection_id}")
             cursor.close()
-            logger.info(f"Killed connection {conn_id}")
+            logger.info(f"Killed connection ID: {connection_id}")
             return True
         except Exception as e:
-            logger.warning(f"Failed to kill connection {conn_id}: {e}")
+            logger.warning(f"Failed to kill connection {connection_id}: {e}")
             return False
 
     def remediate(self) -> int:
         initial_count = self.get_thread_count()
-        killed_count = 0
-
+        logger.info(f"Starting remediation. Initial thread count: {initial_count}")
+        
         idle_connections = self.get_idle_connections()
-        for conn in idle_connections[:self.max_kills - killed_count]:
-            if self.kill_connection(conn['id']):
-                killed_count += 1
-                logger.info(f"Killed idle connection: user={conn['user']}, host={conn['host']}, idle_time={conn['time']}s")
+        if not idle_connections:
+            logger.info("No idle connections found to kill")
+            return 0
 
-        if killed_count < self.max_kills:
-            long_queries = self.get_long_running_queries()
-            for query in long_queries[:self.max_kills - killed_count]:
-                if self.kill_connection(query['id']):
-                    killed_count += 1
-                    logger.info(f"Killed long query: user={query['user']}, host={query['host']}, runtime={query['time']}s")
+        killed_count = 0
+        for conn in idle_connections:
+            if self.kill_connection(conn['ID']):
+                killed_count += 1
 
         final_count = self.get_thread_count()
-        logger.info(f"Remediation complete: killed {killed_count} connections, threads reduced from {initial_count} to {final_count}")
+        logger.info(f"Remediation complete. Killed {killed_count} connections. "
+                   f"Thread count: {initial_count} -> {final_count}")
         return killed_count
 
     def close(self):
@@ -119,15 +103,16 @@ class MySQLConnectionRemediator:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='MySQL connection remediation')
+    parser = argparse.ArgumentParser(description='Remediate MySQL high thread connections')
     parser.add_argument('--host', required=True, help='MySQL host')
     parser.add_argument('--port', type=int, default=3306, help='MySQL port')
     parser.add_argument('--user', required=True, help='MySQL user')
     parser.add_argument('--password', required=True, help='MySQL password')
-    parser.add_argument('--idle-timeout', type=int, default=300, help='Idle timeout in seconds')
-    parser.add_argument('--long-query-time', type=int, default=60, help='Long query time in seconds')
-    parser.add_argument('--max-kills', type=int, default=50, help='Max connections to kill')
-
+    parser.add_argument('--idle-threshold', type=int, default=300, 
+                       help='Idle time threshold in seconds')
+    parser.add_argument('--max-kill', type=int, default=100,
+                       help='Maximum connections to kill')
+    
     args = parser.parse_args()
 
     remediator = MySQLConnectionRemediator(
@@ -135,23 +120,23 @@ def main():
         port=args.port,
         user=args.user,
         password=args.password,
-        idle_timeout=args.idle_timeout,
-        long_query_time=args.long_query_time,
-        max_kills=args.max_kills
+        idle_threshold=args.idle_threshold,
+        max_kill=args.max_kill
     )
 
     try:
         remediator.connect()
         killed = remediator.remediate()
         remediator.close()
+        
         if killed > 0:
-            logger.info(f"SUCCESS: Remediated {killed} connections")
+            logger.info(f"SUCCESS: Remediation completed, killed {killed} idle connections")
             sys.exit(0)
         else:
-            logger.info("INFO: No connections needed remediation")
-            sys.exit(2)
+            logger.info("SUCCESS: No remediation needed")
+            sys.exit(0)
     except Exception as e:
-        logger.error(f"FAILED: {e}")
+        logger.error(f"FAILED: Remediation error: {e}")
         sys.exit(1)
 
 
