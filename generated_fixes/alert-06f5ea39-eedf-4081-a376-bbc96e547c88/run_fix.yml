@@ -1,0 +1,25 @@
+---
+- name: Execute MySQL thread connection remediation
+  hosts: localhost
+  gather_facts: false
+  vars:
+    mysql_host: "{{ lookup('env', 'MYSQL_HOST') | default('10.244.5.1', true) }}"
+    mysql_port: "{{ lookup('env', 'MYSQL_PORT') | default('3306', true) }}"
+    mysql_user: "{{ lookup('env', 'MYSQL_USER') | default('admin', true) }}"
+    mysql_password: "{{ lookup('env', 'MYSQL_PASSWORD') }}"
+    idle_timeout: "{{ lookup('env', 'IDLE_TIMEOUT') | default('300', true) }}"
+    long_query_time: "{{ lookup('env', 'LONG_QUERY_TIME') | default('60', true) }}"
+    max_kills: "{{ lookup('env', 'MAX_KILLS') | default('50', true) }}"
+
+  tasks:
+    - name: Run MySQL connection remediation script
+      ansible.builtin.script:
+        cmd: "fix.py --host {{ mysql_host }} --port {{ mysql_port }} --user {{ mysql_user }} --password {{ mysql_password }} --idle-timeout {{ idle_timeout }} --long-query-time {{ long_query_time }} --max-kills {{ max_kills }}"
+        executable: python3
+      register: remediation_result
+      changed_when: remediation_result.rc == 0
+      failed_when: remediation_result.rc not in [0, 2]
+
+    - name: Display remediation output
+      ansible.builtin.debug:
+        var: remediation_result.stdout_lines
