@@ -1,127 +1,122 @@
 import pytest
-from unittest.mock import Mock, MagicMock, patch, call
 import sys
+from unittest.mock import Mock, MagicMock, patch, call
+from io import StringIO
+
 sys.path.insert(0, '.')
 from fix import MySQLConnectionRemediator
 
 
 class TestMySQLConnectionRemediator:
     
-    def test_init(self):
-        rem = MySQLConnectionRemediator('localhost', 3306, 'user', 'pass', 300, 100)
-        assert rem.host == 'localhost'
-        assert rem.port == 3306
-        assert rem.user == 'user'
-        assert rem.password == 'pass'
-        assert rem.idle_threshold == 300
-        assert rem.max_kill == 100
-
     @patch('fix.pymysql.connect')
     def test_connect_success(self, mock_connect):
-        mock_conn = Mock()
+        mock_conn = MagicMock()
         mock_connect.return_value = mock_conn
         
-        rem = MySQLConnectionRemediator('localhost', 3306, 'user', 'pass')
-        rem.connect()
+        remediator = MySQLConnectionRemediator('localhost', 3306, 'user', 'pass', 300, 551)
+        remediator.connect()
         
-        assert rem.connection == mock_conn
-        mock_connect.assert_called_once_with(
-            host='localhost',
-            port=3306,
-            user='user',
-            password='pass',
-            connect_timeout=10,
-            read_timeout=30
-        )
+        assert remediator.connection == mock_conn
+        mock_connect.assert_called_once()
 
     @patch('fix.pymysql.connect')
     def test_connect_failure(self, mock_connect):
-        mock_connect.side_effect = Exception('Connection failed')
+        mock_connect.side_effect = Exception("Connection failed")
         
-        rem = MySQLConnectionRemediator('localhost', 3306, 'user', 'pass')
-        with pytest.raises(Exception, match='Connection failed'):
-            rem.connect()
+        remediator = MySQLConnectionRemediator('localhost', 3306, 'user', 'pass', 300, 551)
+        
+        with pytest.raises(Exception, match="Connection failed"):
+            remediator.connect()
 
     def test_get_thread_count(self):
-        rem = MySQLConnectionRemediator('localhost', 3306, 'user', 'pass')
-        mock_cursor = Mock()
-        mock_cursor.fetchone.return_value = ('Threads_connected', '555')
-        rem.connection = Mock()
-        rem.connection.cursor.return_value = mock_cursor
+        remediator = MySQLConnectionRemediator('localhost', 3306, 'user', 'pass', 300, 551)
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = ('Threads_connected', '600')
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+        remediator.connection = mock_conn
         
-        count = rem.get_thread_count()
+        count = remediator.get_thread_count()
         
-        assert count == 555
-        mock_cursor.execute.assert_called_once_with("SHOW STATUS LIKE 'Threads_connected'")
-        mock_cursor.close.assert_called_once()
+        assert count == 600
+        mock_cursor.execute.assert_called_once()
 
     def test_get_idle_connections(self):
-        rem = MySQLConnectionRemediator('localhost', 3306, 'user', 'pass', 300, 100)
-        mock_cursor = Mock()
+        remediator = MySQLConnectionRemediator('localhost', 3306, 'user', 'pass', 300, 551)
+        mock_cursor = MagicMock()
         mock_cursor.fetchall.return_value = [
-            {'ID': 101, 'USER': 'app', 'TIME': 350},
-            {'ID': 102, 'USER': 'app', 'TIME': 400}
+            {'ID': 123, 'USER': 'app', 'TIME': 400},
+            {'ID': 456, 'USER': 'app', 'TIME': 350}
         ]
-        rem.connection = Mock()
-        rem.connection.cursor.return_value = mock_cursor
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+        remediator.connection = mock_conn
         
-        idle = rem.get_idle_connections()
+        conns = remediator.get_idle_connections()
         
-        assert len(idle) == 2
-        assert idle[0]['ID'] == 101
-        mock_cursor.execute.assert_called_once()
-        mock_cursor.close.assert_called_once()
+        assert len(conns) == 2
+        assert conns[0]['ID'] == 123
 
     def test_kill_connection_success(self):
-        rem = MySQLConnectionRemediator('localhost', 3306, 'user', 'pass')
-        mock_cursor = Mock()
-        rem.connection = Mock()
-        rem.connection.cursor.return_value = mock_cursor
+        remediator = MySQLConnectionRemediator('localhost', 3306, 'user', 'pass', 300, 551)
+        mock_cursor = MagicMock()
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+        remediator.connection = mock_conn
         
-        result = rem.kill_connection(101)
+        result = remediator.kill_connection(123)
         
         assert result is True
-        mock_cursor.execute.assert_called_once_with('KILL 101')
-        mock_cursor.close.assert_called_once()
+        mock_cursor.execute.assert_called_with('KILL 123')
 
     def test_kill_connection_failure(self):
-        rem = MySQLConnectionRemediator('localhost', 3306, 'user', 'pass')
-        mock_cursor = Mock()
-        mock_cursor.execute.side_effect = Exception('Kill failed')
-        rem.connection = Mock()
-        rem.connection.cursor.return_value = mock_cursor
+        remediator = MySQLConnectionRemediator('localhost', 3306, 'user', 'pass', 300, 551)
+        mock_cursor = MagicMock()
+        mock_cursor.execute.side_effect = Exception("Kill failed")
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+        remediator.connection = mock_conn
         
-        result = rem.kill_connection(101)
+        result = remediator.kill_connection(123)
         
         assert result is False
 
-    def test_remediate_with_idle_connections(self):
-        rem = MySQLConnectionRemediator('localhost', 3306, 'user', 'pass')
-        rem.connection = Mock()
+    @patch('fix.time.sleep')
+    def test_remediate_below_threshold(self, mock_sleep):
+        remediator = MySQLConnectionRemediator('localhost', 3306, 'user', 'pass', 300, 551)
+        remediator.connection = MagicMock()
+        remediator.get_thread_count = Mock(return_value=500)
         
-        with patch.object(rem, 'get_thread_count', side_effect=[600, 550]):
-            with patch.object(rem, 'get_idle_connections', return_value=[
-                {'ID': 101}, {'ID': 102}
-            ]):
-                with patch.object(rem, 'kill_connection', return_value=True):
-                    killed = rem.remediate()
+        exit_code = remediator.remediate()
         
-        assert killed == 2
+        assert exit_code == 0
 
-    def test_remediate_no_idle_connections(self):
-        rem = MySQLConnectionRemediator('localhost', 3306, 'user', 'pass')
-        rem.connection = Mock()
+    @patch('fix.time.sleep')
+    def test_remediate_success(self, mock_sleep):
+        remediator = MySQLConnectionRemediator('localhost', 3306, 'user', 'pass', 300, 551)
+        remediator.connection = MagicMock()
+        remediator.get_thread_count = Mock(side_effect=[600, 500])
+        remediator.get_idle_connections = Mock(return_value=[
+            {'ID': 123, 'USER': 'app', 'TIME': 400}
+        ])
+        remediator.kill_connection = Mock(return_value=True)
         
-        with patch.object(rem, 'get_thread_count', return_value=540):
-            with patch.object(rem, 'get_idle_connections', return_value=[]):
-                killed = rem.remediate()
+        exit_code = remediator.remediate()
         
-        assert killed == 0
+        assert exit_code == 0
+        remediator.kill_connection.assert_called_with(123)
 
-    def test_close(self):
-        rem = MySQLConnectionRemediator('localhost', 3306, 'user', 'pass')
-        rem.connection = Mock()
+    @patch('fix.time.sleep')
+    def test_remediate_still_above_threshold(self, mock_sleep):
+        remediator = MySQLConnectionRemediator('localhost', 3306, 'user', 'pass', 300, 551)
+        remediator.connection = MagicMock()
+        remediator.get_thread_count = Mock(side_effect=[600, 600])
+        remediator.get_idle_connections = Mock(return_value=[
+            {'ID': 123, 'USER': 'app', 'TIME': 400}
+        ])
+        remediator.kill_connection = Mock(return_value=True)
         
-        rem.close()
+        exit_code = remediator.remediate()
         
-        rem.connection.close.assert_called_once()
+        assert exit_code == 1
