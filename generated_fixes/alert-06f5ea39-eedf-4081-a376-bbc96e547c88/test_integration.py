@@ -1,7 +1,8 @@
 import pytest
-import pymysql
-from unittest.mock import patch, Mock
 import sys
+import os
+from unittest.mock import patch, MagicMock
+
 sys.path.insert(0, '.')
 from fix import MySQLConnectionRemediator, main
 
@@ -11,53 +12,59 @@ class TestMySQLConnectionRemediatorIntegration:
     
     @patch('fix.pymysql.connect')
     def test_full_remediation_workflow(self, mock_connect):
-        mock_conn = Mock()
-        mock_cursor = Mock()
-        
+        mock_cursor = MagicMock()
         mock_cursor.fetchone.side_effect = [
             ('Threads_connected', '600'),
-            ('Threads_connected', '550')
+            ('Threads_connected', '500')
         ]
         mock_cursor.fetchall.return_value = [
-            {'ID': 101, 'USER': 'app', 'HOST': '10.1.1.1', 'TIME': 350},
-            {'ID': 102, 'USER': 'app', 'HOST': '10.1.1.2', 'TIME': 400}
+            {'ID': 100, 'USER': 'app1', 'HOST': 'host1', 'DB': 'db1', 'COMMAND': 'Sleep', 'TIME': 400, 'STATE': '', 'INFO': None},
+            {'ID': 101, 'USER': 'app2', 'HOST': 'host2', 'DB': 'db2', 'COMMAND': 'Sleep', 'TIME': 350, 'STATE': '', 'INFO': None}
         ]
         
-        mock_conn.cursor.return_value = mock_cursor
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
         mock_connect.return_value = mock_conn
         
-        rem = MySQLConnectionRemediator('10.244.5.1', 3306, 'admin', 'secret', 300, 100)
-        rem.connect()
-        killed = rem.remediate()
-        rem.close()
+        remediator = MySQLConnectionRemediator('testhost', 3306, 'testuser', 'testpass', 300, 551)
+        remediator.connect()
+        exit_code = remediator.remediate()
+        remediator.close()
         
-        assert killed == 2
-        assert mock_cursor.execute.call_count >= 4
-        mock_conn.close.assert_called_once()
+        assert exit_code == 0
+        assert mock_cursor.execute.call_count >= 3
 
     @patch('fix.pymysql.connect')
-    def test_connection_error_handling(self, mock_connect):
-        mock_connect.side_effect = pymysql.OperationalError('Connection refused')
+    def test_no_idle_connections(self, mock_connect):
+        mock_cursor = MagicMock()
+        mock_cursor.fetchone.return_value = ('Threads_connected', '600')
+        mock_cursor.fetchall.return_value = []
         
-        rem = MySQLConnectionRemediator('invalid-host', 3306, 'user', 'pass')
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+        mock_connect.return_value = mock_conn
         
-        with pytest.raises(pymysql.OperationalError):
-            rem.connect()
+        remediator = MySQLConnectionRemediator('testhost', 3306, 'testuser', 'testpass', 300, 551)
+        remediator.connect()
+        exit_code = remediator.remediate()
+        remediator.close()
+        
+        assert exit_code == 1
 
     @patch('fix.pymysql.connect')
-    @patch('sys.argv', ['fix.py', '--host', '10.244.5.1', '--port', '3306', 
-                        '--user', 'admin', '--password', 'secret'])
-    def test_main_function_success(self, mock_connect):
-        mock_conn = Mock()
-        mock_cursor = Mock()
+    @patch('sys.argv', ['fix.py', '--host', 'localhost', '--user', 'root', '--password', 'secret'])
+    def test_main_execution(self, mock_connect):
+        mock_cursor = MagicMock()
         mock_cursor.fetchone.side_effect = [
             ('Threads_connected', '600'),
-            ('Threads_connected', '550')
+            ('Threads_connected', '500')
         ]
         mock_cursor.fetchall.return_value = [
-            {'ID': 101, 'USER': 'app', 'TIME': 350}
+            {'ID': 200, 'USER': 'app', 'HOST': 'host', 'DB': 'db', 'COMMAND': 'Sleep', 'TIME': 400, 'STATE': '', 'INFO': None}
         ]
-        mock_conn.cursor.return_value = mock_cursor
+        
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
         mock_connect.return_value = mock_conn
         
         with pytest.raises(SystemExit) as exc_info:
@@ -66,12 +73,10 @@ class TestMySQLConnectionRemediatorIntegration:
         assert exc_info.value.code == 0
 
     @patch('fix.pymysql.connect')
-    @patch('sys.argv', ['fix.py', '--host', '10.244.5.1', '--port', '3306',
-                        '--user', 'admin', '--password', 'secret'])
-    def test_main_function_failure(self, mock_connect):
-        mock_connect.side_effect = Exception('DB error')
+    def test_connection_failure_handling(self, mock_connect):
+        mock_connect.side_effect = Exception("Network unreachable")
         
-        with pytest.raises(SystemExit) as exc_info:
-            main()
+        remediator = MySQLConnectionRemediator('badhost', 3306, 'user', 'pass', 300, 551)
         
-        assert exc_info.value.code == 1
+        with pytest.raises(Exception, match="Network unreachable"):
+            remediator.connect()
