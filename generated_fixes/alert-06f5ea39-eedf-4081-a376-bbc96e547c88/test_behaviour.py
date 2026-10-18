@@ -1,93 +1,90 @@
 import pytest
-from unittest.mock import patch, Mock
+from unittest.mock import MagicMock, patch
 import sys
-sys.path.insert(0, '.')
-from fix import MySQLConnectionRemediator
+
+sys.path.insert(0, '/app/generated_fixes/alert-06f5ea39-eedf-4081-a376-bbc96e547c88')
+from fix import MySQLThreadRemediator, THREAD_THRESHOLD, SAFE_THRESHOLD
 
 
-@pytest.mark.behaviour
 class TestMySQLRemediationBehaviour:
     
-    @patch('fix.pymysql.connect')
-    def test_given_high_thread_count_when_remediate_then_idle_connections_killed(self, mock_connect):
-        mock_conn = Mock()
-        mock_cursor = Mock()
-        mock_conn.cursor.return_value = mock_cursor
-        mock_connect.return_value = mock_conn
+    def test_given_thread_count_below_threshold_when_remediate_then_no_action_taken(self):
+        remediator = MySQLThreadRemediator('localhost', 3306, 'user', 'pass')
+        remediator.connection = MagicMock()
         
-        mock_cursor.fetchone.side_effect = [
-            ('Threads_connected', '580'),
-            ('Threads_connected', '540')
-        ]
-        mock_cursor.fetchall.return_value = [
-            {'ID': 201, 'USER': 'app1', 'HOST': '10.1.1.1', 'COMMAND': 'Sleep', 'TIME': 350, 'STATE': '', 'INFO': None, 'DB': 'testdb'},
-            {'ID': 202, 'USER': 'app2', 'HOST': '10.1.1.2', 'COMMAND': 'Sleep', 'TIME': 400, 'STATE': '', 'INFO': None, 'DB': 'testdb'}
-        ]
+        with patch.object(remediator, 'get_thread_count', return_value=500):
+            with patch.object(remediator, 'get_idle_connections') as mock_idle:
+                result = remediator.remediate()
+                
+                assert result is True
+                mock_idle.assert_not_called()
+    
+    def test_given_high_threads_and_idle_conns_when_remediate_then_connections_killed(self):
+        remediator = MySQLThreadRemediator('localhost', 3306, 'user', 'pass')
+        remediator.connection = MagicMock()
         
-        remediator = MySQLConnectionRemediator('10.244.5.1', 3306, 'admin', 'password', 300, 100)
-        remediator.connect()
-        
-        initial_count = remediator.get_thread_count()
-        assert initial_count == 580
-        
-        killed_count = remediator.remediate()
-        
-        assert killed_count == 2
-        kill_calls = [call for call in mock_cursor.execute.call_args_list if 'KILL' in str(call)]
-        assert len(kill_calls) == 2
-        
-        remediator.close()
-
-    @patch('fix.pymysql.connect')
-    def test_given_no_idle_connections_when_remediate_then_no_kills_executed(self, mock_connect):
-        mock_conn = Mock()
-        mock_cursor = Mock()
-        mock_conn.cursor.return_value = mock_cursor
-        mock_connect.return_value = mock_conn
-        
-        mock_cursor.fetchone.return_value = ('Threads_connected', '540')
-        mock_cursor.fetchall.return_value = []
-        
-        remediator = MySQLConnectionRemediator('10.244.5.1', 3306, 'admin', 'password')
-        remediator.connect()
-        
-        killed_count = remediator.remediate()
-        
-        assert killed_count == 0
-        kill_calls = [call for call in mock_cursor.execute.call_args_list if 'KILL' in str(call)]
-        assert len(kill_calls) == 0
-        
-        remediator.close()
-
-    @patch('fix.pymysql.connect')
-    def test_given_connection_failure_when_connect_then_exception_raised(self, mock_connect):
-        mock_connect.side_effect = Exception('Connection timeout')
-        
-        remediator = MySQLConnectionRemediator('invalid-host', 3306, 'user', 'pass')
-        
-        with pytest.raises(Exception, match='Connection timeout'):
-            remediator.connect()
-
-    @patch('fix.pymysql.connect')
-    def test_given_max_kill_limit_when_remediate_then_respects_limit(self, mock_connect):
-        mock_conn = Mock()
-        mock_cursor = Mock()
-        mock_conn.cursor.return_value = mock_cursor
-        mock_connect.return_value = mock_conn
-        
-        mock_cursor.fetchone.side_effect = [
-            ('Threads_connected', '610'),
-            ('Threads_connected', '595')
+        idle_conns = [
+            {'id': 100, 'user': 'app', 'host': '10.1.1.1', 'time': 400},
+            {'id': 101, 'user': 'app', 'host': '10.1.1.2', 'time': 500},
+            {'id': 102, 'user': 'app', 'host': '10.1.1.3', 'time': 600}
         ]
         
-        idle_connections = [{'ID': i, 'USER': f'app{i}', 'TIME': 400} for i in range(1, 21)]
-        mock_cursor.fetchall.return_value = idle_connections[:15]
+        with patch.object(remediator, 'get_thread_count', side_effect=[600, 500, 450, 380]):
+            with patch.object(remediator, 'get_idle_connections', return_value=idle_conns):
+                with patch.object(remediator, 'kill_connection', return_value=True) as mock_kill:
+                    result = remediator.remediate()
+                    
+                    assert result is True
+                    assert mock_kill.call_count >= 1
+                    assert mock_kill.call_count <= len(idle_conns)
+    
+    def test_given_high_threads_and_no_idle_conns_when_remediate_then_failure(self):
+        remediator = MySQLThreadRemediator('localhost', 3306, 'user', 'pass')
+        remediator.connection = MagicMock()
         
-        remediator = MySQLConnectionRemediator('10.244.5.1', 3306, 'admin', 'password', 300, 15)
-        remediator.connect()
+        with patch.object(remediator, 'get_thread_count', return_value=600):
+            with patch.object(remediator, 'get_idle_connections', return_value=[]):
+                result = remediator.remediate()
+                
+                assert result is False
+    
+    def test_given_thread_reduction_reaches_safe_threshold_when_remediate_then_early_exit(self):
+        remediator = MySQLThreadRemediator('localhost', 3306, 'user', 'pass')
+        remediator.connection = MagicMock()
         
-        killed_count = remediator.remediate()
+        idle_conns = [
+            {'id': 100, 'user': 'app', 'time': 400},
+            {'id': 101, 'user': 'app', 'time': 500},
+            {'id': 102, 'user': 'app', 'time': 600},
+            {'id': 103, 'user': 'app', 'time': 700},
+            {'id': 104, 'user': 'app', 'time': 800}
+        ]
         
-        assert killed_count == 15
+        with patch.object(remediator, 'get_thread_count', side_effect=[600, 550, 500, 380]):
+            with patch.object(remediator, 'get_idle_connections', return_value=idle_conns):
+                with patch.object(remediator, 'kill_connection', return_value=True) as mock_kill:
+                    result = remediator.remediate()
+                    
+                    assert result is True
+                    assert mock_kill.call_count < len(idle_conns)
+    
+    def test_given_connection_failure_when_connect_then_returns_false(self):
+        with patch('fix.pymysql.connect', side_effect=Exception("Connection error")):
+            remediator = MySQLThreadRemediator('invalid-host', 3306, 'user', 'pass')
+            result = remediator.connect()
+            
+            assert result is False
+            assert remediator.connection is None
+    
+    def test_given_successful_remediation_when_final_count_checked_then_below_safe_threshold(self):
+        remediator = MySQLThreadRemediator('localhost', 3306, 'user', 'pass')
+        remediator.connection = MagicMock()
         
-        remediator.close()
+        idle_conns = [{'id': i, 'user': 'app', 'time': 400} for i in range(100, 110)]
+        
+        with patch.object(remediator, 'get_thread_count', side_effect=[600, 590, 580, 570, 560, 550, 540, 530, 520, 510, 350]):
+            with patch.object(remediator, 'get_idle_connections', return_value=idle_conns):
+                with patch.object(remediator, 'kill_connection', return_value=True):
+                    result = remediator.remediate()
+                    
+                    assert result is True

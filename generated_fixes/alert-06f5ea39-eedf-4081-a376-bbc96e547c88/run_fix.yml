@@ -1,21 +1,20 @@
 ---
-- name: Remediate MySQL high thread connection count
+- name: Remediate MySQL high thread connections
   hosts: localhost
   gather_facts: false
   vars:
-    mysql_host: "{{ lookup('env', 'MYSQL_HOST') | default('10.244.5.1', true) }}"
-    mysql_port: "{{ lookup('env', 'MYSQL_PORT') | default('3306', true) }}"
-    mysql_user: "{{ lookup('env', 'MYSQL_USER') | default('admin', true) }}"
+    fix_script_path: "{{ playbook_dir }}/fix.py"
+    mysql_host: "10.244.5.1"
+    mysql_port: 3306
+    mysql_user: "{{ lookup('env', 'MYSQL_USER') | default('root', true) }}"
     mysql_password: "{{ lookup('env', 'MYSQL_PASSWORD') | default('', true) }}"
-    idle_threshold: "{{ lookup('env', 'IDLE_THRESHOLD') | default('300', true) }}"
-    max_kill: "{{ lookup('env', 'MAX_KILL') | default('100', true) }}"
   tasks:
-    - name: Execute MySQL connection remediation script
+    - name: Execute MySQL thread remediation script
       ansible.builtin.script:
-        cmd: "fix.py --host {{ mysql_host }} --port {{ mysql_port }} --user {{ mysql_user }} --password {{ mysql_password }} --idle-threshold {{ idle_threshold }} --max-kill {{ max_kill }}"
+        cmd: "{{ fix_script_path }} --host {{ mysql_host }} --port {{ mysql_port }} --user {{ mysql_user }} --password {{ mysql_password }}"
         executable: python3
       register: fix_result
-      failed_when: fix_result.rc != 0
+      changed_when: fix_result.rc == 0
 
     - name: Display remediation output
       ansible.builtin.debug:

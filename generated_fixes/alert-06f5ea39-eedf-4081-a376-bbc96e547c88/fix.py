@@ -7,23 +7,25 @@ from typing import List, Dict
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
 
+THREAD_THRESHOLD = 551
+SAFE_THRESHOLD = 400
+IDLE_TIME_SECONDS = 300
 
-class MySQLConnectionRemediator:
-    def __init__(self, host: str, port: int, user: str, password: str, 
-                 idle_threshold: int = 300, max_kill: int = 100):
+
+class MySQLThreadRemediator:
+    def __init__(self, host: str, port: int, user: str, password: str):
         self.host = host
         self.port = port
         self.user = user
         self.password = password
-        self.idle_threshold = idle_threshold
-        self.max_kill = max_kill
         self.connection = None
 
-    def connect(self):
+    def connect(self) -> bool:
         try:
             self.connection = pymysql.connect(
                 host=self.host,
@@ -31,113 +33,133 @@ class MySQLConnectionRemediator:
                 user=self.user,
                 password=self.password,
                 connect_timeout=10,
-                read_timeout=30
+                cursorclass=pymysql.cursors.DictCursor
             )
             logger.info(f"Connected to MySQL at {self.host}:{self.port}")
-        except Exception as e:
-            logger.error(f"Failed to connect to MySQL: {e}")
-            raise
-
-    def get_thread_count(self) -> int:
-        cursor = self.connection.cursor()
-        cursor.execute("SHOW STATUS LIKE 'Threads_connected'")
-        result = cursor.fetchone()
-        cursor.close()
-        if result:
-            count = int(result[1])
-            logger.info(f"Current THREADS_CONNECTED: {count}")
-            return count
-        return 0
-
-    def get_idle_connections(self) -> List[Dict]:
-        cursor = self.connection.cursor(pymysql.cursors.DictCursor)
-        query = """
-            SELECT ID, USER, HOST, DB, COMMAND, TIME, STATE, INFO
-            FROM information_schema.PROCESSLIST
-            WHERE COMMAND = 'Sleep'
-            AND TIME > %s
-            AND ID != CONNECTION_ID()
-            ORDER BY TIME DESC
-            LIMIT %s
-        """
-        cursor.execute(query, (self.idle_threshold, self.max_kill))
-        results = cursor.fetchall()
-        cursor.close()
-        logger.info(f"Found {len(results)} idle connections exceeding {self.idle_threshold}s")
-        return results
-
-    def kill_connection(self, connection_id: int) -> bool:
-        try:
-            cursor = self.connection.cursor()
-            cursor.execute(f"KILL {connection_id}")
-            cursor.close()
-            logger.info(f"Killed connection ID: {connection_id}")
             return True
         except Exception as e:
-            logger.warning(f"Failed to kill connection {connection_id}: {e}")
+            logger.error(f"Failed to connect to MySQL: {e}")
             return False
 
-    def remediate(self) -> int:
-        initial_count = self.get_thread_count()
-        logger.info(f"Starting remediation. Initial thread count: {initial_count}")
-        
-        idle_connections = self.get_idle_connections()
-        if not idle_connections:
-            logger.info("No idle connections found to kill")
-            return 0
+    def get_thread_count(self) -> int:
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute("SHOW STATUS LIKE 'Threads_connected'")
+                result = cursor.fetchone()
+                count = int(result['Value'])
+                logger.info(f"Current THREADS_CONNECTED: {count}")
+                return count
+        except Exception as e:
+            logger.error(f"Failed to get thread count: {e}")
+            raise
 
-        killed_count = 0
-        for conn in idle_connections:
-            if self.kill_connection(conn['ID']):
-                killed_count += 1
+    def get_idle_connections(self) -> List[Dict]:
+        try:
+            with self.connection.cursor() as cursor:
+                query = f"""
+                SELECT id, user, host, db, command, time, state
+                FROM information_schema.processlist
+                WHERE command = 'Sleep'
+                AND time > {IDLE_TIME_SECONDS}
+                AND id != CONNECTION_ID()
+                ORDER BY time DESC
+                """
+                cursor.execute(query)
+                results = cursor.fetchall()
+                logger.info(f"Found {len(results)} idle connections (>5min)")
+                return results
+        except Exception as e:
+            logger.error(f"Failed to get idle connections: {e}")
+            raise
 
-        final_count = self.get_thread_count()
-        logger.info(f"Remediation complete. Killed {killed_count} connections. "
-                   f"Thread count: {initial_count} -> {final_count}")
-        return killed_count
+    def kill_connection(self, conn_id: int) -> bool:
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute(f"KILL {conn_id}")
+                logger.info(f"Killed connection ID: {conn_id}")
+                return True
+        except Exception as e:
+            logger.warning(f"Failed to kill connection {conn_id}: {e}")
+            return False
+
+    def remediate(self) -> bool:
+        try:
+            current_threads = self.get_thread_count()
+            
+            if current_threads <= THREAD_THRESHOLD:
+                logger.info(f"Thread count {current_threads} is below threshold {THREAD_THRESHOLD}, no action needed")
+                return True
+
+            logger.warning(f"Thread count {current_threads} exceeds threshold {THREAD_THRESHOLD}, starting remediation")
+            
+            idle_connections = self.get_idle_connections()
+            
+            if not idle_connections:
+                logger.warning("No idle connections to kill, manual investigation required")
+                return False
+
+            killed_count = 0
+            for conn in idle_connections:
+                if self.kill_connection(conn['id']):
+                    killed_count += 1
+                
+                current_threads = self.get_thread_count()
+                if current_threads <= SAFE_THRESHOLD:
+                    logger.info(f"Reached safe threshold {SAFE_THRESHOLD}, stopped cleanup")
+                    break
+
+            logger.info(f"Killed {killed_count} idle connections")
+            
+            final_threads = self.get_thread_count()
+            
+            if final_threads <= SAFE_THRESHOLD:
+                logger.info(f"Remediation successful: threads reduced to {final_threads}")
+                return True
+            else:
+                logger.warning(f"Thread count {final_threads} still above safe threshold {SAFE_THRESHOLD}")
+                return False
+
+        except Exception as e:
+            logger.error(f"Remediation failed: {e}")
+            return False
 
     def close(self):
         if self.connection:
             self.connection.close()
-            logger.info("MySQL connection closed")
+            logger.info("Closed MySQL connection")
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Remediate MySQL high thread connections')
+    parser = argparse.ArgumentParser(description='MySQL Thread Connection Remediation')
     parser.add_argument('--host', required=True, help='MySQL host')
     parser.add_argument('--port', type=int, default=3306, help='MySQL port')
     parser.add_argument('--user', required=True, help='MySQL user')
-    parser.add_argument('--password', required=True, help='MySQL password')
-    parser.add_argument('--idle-threshold', type=int, default=300, 
-                       help='Idle time threshold in seconds')
-    parser.add_argument('--max-kill', type=int, default=100,
-                       help='Maximum connections to kill')
+    parser.add_argument('--password', default='', help='MySQL password')
     
     args = parser.parse_args()
-
-    remediator = MySQLConnectionRemediator(
+    
+    remediator = MySQLThreadRemediator(
         host=args.host,
         port=args.port,
         user=args.user,
-        password=args.password,
-        idle_threshold=args.idle_threshold,
-        max_kill=args.max_kill
+        password=args.password
     )
-
+    
     try:
-        remediator.connect()
-        killed = remediator.remediate()
-        remediator.close()
+        if not remediator.connect():
+            sys.exit(1)
         
-        if killed > 0:
-            logger.info(f"SUCCESS: Remediation completed, killed {killed} idle connections")
+        if remediator.remediate():
+            logger.info("Remediation completed successfully")
             sys.exit(0)
         else:
-            logger.info("SUCCESS: No remediation needed")
-            sys.exit(0)
+            logger.error("Remediation completed with warnings")
+            sys.exit(1)
     except Exception as e:
-        logger.error(f"FAILED: Remediation error: {e}")
+        logger.error(f"Unexpected error: {e}")
         sys.exit(1)
+    finally:
+        remediator.close()
 
 
 if __name__ == '__main__':
