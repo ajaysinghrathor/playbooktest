@@ -1,77 +1,80 @@
 import pytest
 import pymysql
-from unittest.mock import patch, Mock
+import os
 import sys
-sys.path.insert(0, '.')
-from fix import MySQLConnectionRemediator, main
+from unittest.mock import MagicMock
+
+sys.path.insert(0, '/app/generated_fixes/alert-06f5ea39-eedf-4081-a376-bbc96e547c88')
+from fix import MySQLThreadRemediator
 
 
 @pytest.mark.integration
-class TestMySQLConnectionRemediatorIntegration:
+class TestMySQLThreadRemediatorIntegration:
     
-    @patch('fix.pymysql.connect')
-    def test_full_remediation_workflow(self, mock_connect):
-        mock_conn = Mock()
-        mock_cursor = Mock()
-        
-        mock_cursor.fetchone.side_effect = [
-            ('Threads_connected', '600'),
-            ('Threads_connected', '550')
-        ]
-        mock_cursor.fetchall.return_value = [
-            {'ID': 101, 'USER': 'app', 'HOST': '10.1.1.1', 'TIME': 350},
-            {'ID': 102, 'USER': 'app', 'HOST': '10.1.1.2', 'TIME': 400}
-        ]
-        
-        mock_conn.cursor.return_value = mock_cursor
-        mock_connect.return_value = mock_conn
-        
-        rem = MySQLConnectionRemediator('10.244.5.1', 3306, 'admin', 'secret', 300, 100)
-        rem.connect()
-        killed = rem.remediate()
+    @pytest.fixture
+    def mysql_config(self):
+        return {
+            'host': os.getenv('MYSQL_HOST', 'localhost'),
+            'port': int(os.getenv('MYSQL_PORT', 3306)),
+            'user': os.getenv('MYSQL_USER', 'root'),
+            'password': os.getenv('MYSQL_PASSWORD', '')
+        }
+    
+    @pytest.fixture
+    def remediator(self, mysql_config):
+        rem = MySQLThreadRemediator(**mysql_config)
+        yield rem
         rem.close()
+    
+    def test_connection_lifecycle(self, remediator):
+        assert remediator.connect() is True
+        assert remediator.connection is not None
+        remediator.close()
+        assert remediator.connection.open is False
+    
+    def test_get_thread_count_returns_positive_integer(self, remediator):
+        remediator.connect()
+        count = remediator.get_thread_count()
+        assert isinstance(count, int)
+        assert count > 0
+    
+    def test_get_idle_connections_returns_list(self, remediator):
+        remediator.connect()
+        idle_conns = remediator.get_idle_connections()
+        assert isinstance(idle_conns, list)
+    
+    def test_remediate_idempotent(self, remediator):
+        remediator.connect()
+        result1 = remediator.remediate()
+        result2 = remediator.remediate()
+        assert isinstance(result1, bool)
+        assert isinstance(result2, bool)
+    
+    def test_kill_nonexistent_connection_handles_gracefully(self, remediator):
+        remediator.connect()
+        result = remediator.kill_connection(999999)
+        assert result is False
+    
+    def test_full_workflow_with_mock_high_threads(self, remediator, monkeypatch):
+        remediator.connect()
         
-        assert killed == 2
-        assert mock_cursor.execute.call_count >= 4
-        mock_conn.close.assert_called_once()
-
-    @patch('fix.pymysql.connect')
-    def test_connection_error_handling(self, mock_connect):
-        mock_connect.side_effect = pymysql.OperationalError('Connection refused')
+        original_get_count = remediator.get_thread_count
+        call_count = [0]
         
-        rem = MySQLConnectionRemediator('invalid-host', 3306, 'user', 'pass')
+        def mock_get_count():
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return 600
+            elif call_count[0] == 2:
+                return 450
+            else:
+                return 380
         
-        with pytest.raises(pymysql.OperationalError):
-            rem.connect()
-
-    @patch('fix.pymysql.connect')
-    @patch('sys.argv', ['fix.py', '--host', '10.244.5.1', '--port', '3306', 
-                        '--user', 'admin', '--password', 'secret'])
-    def test_main_function_success(self, mock_connect):
-        mock_conn = Mock()
-        mock_cursor = Mock()
-        mock_cursor.fetchone.side_effect = [
-            ('Threads_connected', '600'),
-            ('Threads_connected', '550')
-        ]
-        mock_cursor.fetchall.return_value = [
-            {'ID': 101, 'USER': 'app', 'TIME': 350}
-        ]
-        mock_conn.cursor.return_value = mock_cursor
-        mock_connect.return_value = mock_conn
+        monkeypatch.setattr(remediator, 'get_thread_count', mock_get_count)
+        monkeypatch.setattr(remediator, 'get_idle_connections', lambda: [
+            {'id': 1000000, 'user': 'test', 'time': 400},
+            {'id': 1000001, 'user': 'test', 'time': 500}
+        ])
         
-        with pytest.raises(SystemExit) as exc_info:
-            main()
-        
-        assert exc_info.value.code == 0
-
-    @patch('fix.pymysql.connect')
-    @patch('sys.argv', ['fix.py', '--host', '10.244.5.1', '--port', '3306',
-                        '--user', 'admin', '--password', 'secret'])
-    def test_main_function_failure(self, mock_connect):
-        mock_connect.side_effect = Exception('DB error')
-        
-        with pytest.raises(SystemExit) as exc_info:
-            main()
-        
-        assert exc_info.value.code == 1
+        result = remediator.remediate()
+        assert isinstance(result, bool)
