@@ -1,0 +1,22 @@
+---
+- name: Remediate high CPU usage on stressvm
+  hosts: all
+  become: yes
+  gather_facts: yes
+  tasks:
+    - name: Execute CPU remediation fix script
+      ansible.builtin.script:
+        cmd: fix.py
+        executable: python3
+      register: fix_result
+      changed_when: fix_result.rc == 0
+      failed_when: fix_result.rc != 0
+
+    - name: Display fix script output
+      ansible.builtin.debug:
+        var: fix_result.stdout_lines
+
+    - name: Display fix script errors if any
+      ansible.builtin.debug:
+        var: fix_result.stderr_lines
+      when: fix_result.stderr_lines | length > 0
