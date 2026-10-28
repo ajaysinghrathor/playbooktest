@@ -1,0 +1,33 @@
+---
+- name: Remediate MySQL Thread Connection Threshold Breach
+  hosts: mysql_hosts
+  gather_facts: no
+  vars:
+    mysql_host: "{{ target_mysql_host | default('localhost') }}"
+    mysql_port: "{{ target_mysql_port | default(3306) }}"
+    mysql_user: "{{ target_mysql_user | default('root') }}"
+    mysql_password: "{{ target_mysql_password }}"
+    idle_threshold: "{{ mysql_idle_threshold | default(300) }}"
+    max_connections_target: "{{ mysql_max_connections_target | default(1000) }}"
+    thread_threshold: "{{ mysql_thread_threshold | default(551) }}"
+    dry_run: "{{ mysql_dry_run | default(false) }}"
+
+  tasks:
+    - name: Execute MySQL connection remediation script
+      ansible.builtin.script:
+        cmd: >
+          fix.py
+          --host {{ mysql_host }}
+          --port {{ mysql_port }}
+          --user {{ mysql_user }}
+          --password {{ mysql_password }}
+          --idle-threshold {{ idle_threshold }}
+          --max-connections {{ max_connections_target }}
+          --thread-threshold {{ thread_threshold }}
+          {% if dry_run %}--dry-run{% endif %}
+      register: fix_result
+      changed_when: fix_result.rc == 0
+
+    - name: Display remediation output
+      ansible.builtin.debug:
+        var: fix_result.stdout_lines
