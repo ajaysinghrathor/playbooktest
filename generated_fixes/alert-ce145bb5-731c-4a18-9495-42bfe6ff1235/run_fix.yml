@@ -1,0 +1,21 @@
+---
+- name: Remediate MySQL thread connection overload
+  hosts: localhost
+  gather_facts: false
+  vars:
+    fix_script_path: "{{ playbook_dir }}/fix.py"
+    mysql_host: "{{ lookup('env', 'MYSQL_HOST') | default('10.244.5.1', true) }}"
+    mysql_port: "{{ lookup('env', 'MYSQL_PORT') | default('3306', true) }}"
+    mysql_user: "{{ lookup('env', 'MYSQL_USER') | default('admin', true) }}"
+    mysql_password: "{{ lookup('env', 'MYSQL_PASSWORD') }}"
+  tasks:
+    - name: Execute MySQL connection remediation script
+      ansible.builtin.script:
+        cmd: "python3 {{ fix_script_path }} --host {{ mysql_host }} --port {{ mysql_port }} --user {{ mysql_user }} --password {{ mysql_password }}"
+      register: fix_result
+      changed_when: "'Remediation completed successfully' in fix_result.stdout"
+      failed_when: fix_result.rc != 0
+
+    - name: Display remediation output
+      ansible.builtin.debug:
+        var: fix_result.stdout_lines
