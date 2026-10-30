@@ -1,0 +1,35 @@
+---
+- name: Remediate AH Password Reset Service Failure
+  hosts: "{{ target_hosts | default('localhost') }}"
+  gather_facts: false
+  vars:
+    service_endpoint: "{{ lookup('env', 'SERVICE_ENDPOINT') | default('https://ah-password-reset.internal.nl/api', true) }}"
+    service_name: "{{ lookup('env', 'SERVICE_NAME') | default('ah-password-reset-service', true) }}"
+    business_service: "{{ lookup('env', 'BUSINESS_SERVICE') | default('AH1432AP305-01', true) }}"
+    region: "{{ lookup('env', 'REGION') | default('NL', true) }}"
+    api_key: "{{ lookup('env', 'API_KEY') | default('', true) }}"
+    timeout: "{{ lookup('env', 'TIMEOUT') | default('60', true) }}"
+    dry_run: "{{ lookup('env', 'DRY_RUN') | default('false', true) }}"
+    max_retries: "{{ lookup('env', 'MAX_RETRIES') | default('3', true) }}"
+
+  tasks:
+    - name: Execute password reset service remediation script
+      ansible.builtin.script:
+        cmd: >
+          fix.py
+          --service-endpoint "{{ service_endpoint }}"
+          --service-name "{{ service_name }}"
+          --business-service "{{ business_service }}"
+          --region "{{ region }}"
+          --api-key "{{ api_key }}"
+          --timeout {{ timeout }}
+          --max-retries {{ max_retries }}
+          {{ '--dry-run' if dry_run | bool else '' }}
+        executable: python3
+      register: fix_result
+      changed_when: fix_result.rc == 0
+      failed_when: fix_result.rc != 0
+
+    - name: Display remediation output
+      ansible.builtin.debug:
+        var: fix_result.stdout_lines
